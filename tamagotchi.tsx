@@ -1,4 +1,21 @@
+/**
+ * @stele-manifest
+ * name: Tamagotchi
+ * description: Raise a virtual pet — feed, play, sleep, repeat. State persists across reopens via window.storage. The pet ages over real time, and how you care for them in the first 3 minutes decides their adult form.
+ * archetype: self-contained
+ */
+
 import { useState, useEffect } from 'react';
+
+declare global {
+  interface Window {
+    storage?: {
+      get: (key: string, shared?: boolean) => Promise<{ key: string; value: string; shared: boolean } | null>;
+      set: (key: string, value: string, shared?: boolean) => Promise<void>;
+      delete: (key: string, shared?: boolean) => Promise<void>;
+    };
+  }
+}
 
 const STORAGE_KEY = 'stele-tamagotchi-v1';
 const TICK_MS = 500;
@@ -63,21 +80,26 @@ function newPet(name: string): Pet {
   };
 }
 
-function load(): Pet | null {
+async function load(): Promise<Pet | null> {
+  if (!window.storage) return null;
   try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    return raw ? JSON.parse(raw) : null;
+    const got = await window.storage.get(STORAGE_KEY);
+    return got?.value ? JSON.parse(got.value) : null;
   } catch {
     return null;
   }
 }
 
 function save(p: Pet) {
-  try { localStorage.setItem(STORAGE_KEY, JSON.stringify(p)); } catch {}
+  // Fire-and-forget. window.storage RPCs through the bridge to SQLite/IDB,
+  // returning a promise we don't need to await for the next tick to proceed.
+  if (!window.storage) return;
+  window.storage.set(STORAGE_KEY, JSON.stringify(p)).catch(() => {});
 }
 
 function clearPet() {
-  try { localStorage.removeItem(STORAGE_KEY); } catch {}
+  if (!window.storage) return;
+  window.storage.delete(STORAGE_KEY).catch(() => {});
 }
 
 function ageMs(p: Pet): number {
@@ -574,7 +596,21 @@ const ANIMATIONS = `
 `;
 
 export default function Tamagotchi() {
-  const [pet, setPet] = useState<Pet | null>(() => load());
+  const [pet, setPet] = useState<Pet | null>(null);
+  const [loaded, setLoaded] = useState(false);
+
+  // Load any saved pet from window.storage on first mount. Async because the
+  // bridge RPCs to SQLite (desktop) or IndexedDB (web) under the hood.
+  useEffect(() => {
+    let cancelled = false;
+    load().then((p) => {
+      if (!cancelled) {
+        setPet(p);
+        setLoaded(true);
+      }
+    });
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     if (!pet) return;
@@ -589,6 +625,17 @@ export default function Tamagotchi() {
     }, TICK_MS);
     return () => clearInterval(id);
   }, [pet?.createdAt]);
+
+  if (!loaded) {
+    return (
+      <>
+        <style>{ANIMATIONS}</style>
+        <div className="min-h-screen bg-gradient-to-br from-indigo-950 via-slate-900 to-purple-950 text-slate-100 font-sans flex items-center justify-center">
+          <div className="text-slate-500 text-sm">Loading…</div>
+        </div>
+      </>
+    );
+  }
 
   if (!pet) {
     return (
