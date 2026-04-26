@@ -1,0 +1,170 @@
+/**
+ * @stele-manifest
+ * name: Trevor ↔ Izaiah #973d
+ * version: 1.0.0
+ * description: Paired chat between Izaiah and Trevor. Both files together unlock the conversation; the file IS the secret, so don't share with anyone you wouldn't want in the conversation. Messages travel end-to-end-encrypted over a WebRTC data channel — the signaling server only sees the SDP envelope.
+ * archetype: paired
+ * pairing_id: stele-pair-528badc0d609befa74a4f34e4e26973d
+ * partner_pubkey: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2jbxKUV6iTscjNUkKHe1199jEIng4ql+IYHquPNWbGeLH7xSjHUYusnbDJrb5LuVyHAEV8uMSla/bwe4ExH8Mw==
+ * private_key: MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgVLdocr9eoibdCyQ9Jk70CK5fD5vIWaR2JjBoKCY/+kahRANCAASXQ54QlDSCXq+7MvyA7T2ahWidypOdx36Bb6K11paGgfG21gvPZMvMRgmeIb86LRo2Q5wFw6tWhgPTqZRGeGhu
+ */
+
+import { useEffect, useRef, useState } from 'react';
+
+const ME = "Izaiah";
+const PARTNER = "Trevor";
+const SAFETY_CODE = "F01332";
+
+export default function PairChat() {
+  const [status, setStatus] = useState('not connected');
+  const [lines, setLines] = useState([]);
+  const [draft, setDraft] = useState('');
+  const [hasConnected, setHasConnected] = useState(false);
+  const [unexpectedDrop, setUnexpectedDrop] = useState(false);
+  const connRef = useRef(null);
+  const closingRef = useRef(false);
+  const hasConnectedRef = useRef(false);
+
+  const addLine = (from, text) => {
+    setLines((prev) => [...prev, { from, text, ts: Date.now() }]);
+  };
+
+  useEffect(() => {
+    let cancelled = false;
+    setStatus('connecting…');
+    addLine('system', `Connecting to ${PARTNER} via signaling server…`);
+
+    window.stele.pair.connect().then((conn) => {
+      if (cancelled) { conn.close(); return; }
+      connRef.current = conn;
+      setStatus(conn.initialStatus || 'connecting…');
+      conn.onStatusChange((s) => {
+        if (cancelled) return;
+        setStatus(s);
+        if (s === 'connected') {
+          setHasConnected(true);
+          hasConnectedRef.current = true;
+          setUnexpectedDrop(false);
+        }
+        // We were connected and now aren't — and *we* didn't close. Could be
+        // partner closed their tab, network blip, or someone else opened a copy
+        // of one of the files and stole the session. Surface the possibility.
+        if ((s === 'disconnected' || s === 'error') && hasConnectedRef.current && !closingRef.current) {
+          setUnexpectedDrop(true);
+        }
+      });
+      conn.onMessage((data) => { if (!cancelled) addLine('them', data); });
+    }).catch((err) => {
+      if (cancelled) return;
+      setStatus('error');
+      addLine('system', `connect failed: ${String(err)}`);
+    });
+
+    return () => {
+      cancelled = true;
+      closingRef.current = true;
+      try { connRef.current && connRef.current.close(); } catch (e) { /* swallow */ }
+    };
+  }, []);
+
+  const handleSend = async () => {
+    const text = draft.trim();
+    if (!text || !connRef.current) return;
+    try {
+      await connRef.current.send(text);
+      addLine('me', text);
+      setDraft('');
+    } catch (err) {
+      addLine('system', `send failed: ${String(err)}`);
+    }
+  };
+
+  const ready = status === 'connected';
+
+  return (
+    <div style={{ fontFamily: 'system-ui, -apple-system, sans-serif', maxWidth: 560, margin: '40px auto', padding: '0 20px', color: '#1e293b' }}>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 8 }}>
+        <h1 style={{ fontSize: 22, margin: 0 }}>Pair chat — {ME}</h1>
+        <StatusPill status={status} />
+      </div>
+      <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 12, fontSize: 11, color: '#64748b', fontFamily: 'ui-monospace, monospace' }}>
+        <span>Safety code: <strong style={{ color: '#0f172a', letterSpacing: '0.08em' }}>{SAFETY_CODE}</strong></span>
+        <span style={{ fontSize: 10 }}>both screens should match</span>
+      </div>
+
+      {unexpectedDrop && (
+        <div style={{ background: '#fef3c7', border: '1px solid #fbbf24', color: '#78350f', padding: '10px 12px', borderRadius: 8, fontSize: 12, lineHeight: 1.5, marginBottom: 12 }}>
+          <strong>Connection ended.</strong> Common: partner closed their tab, or a network blip. Less common but worth knowing: if someone else opened a copy of either file, they'd take over the session this way. If you didn't expect the drop and you've shared a file with anyone besides {PARTNER}, regenerate the pair.
+        </div>
+      )}
+
+      <p style={{ color: '#64748b', fontSize: 13, lineHeight: 1.5, marginBottom: 16 }}>
+        Open the partner artifact ({PARTNER}'s file) in another window or device.
+        Both files together unlock the conversation; treat the file like a Discord invite or a 1Password secret — anyone with it can be you in this chat.
+      </p>
+
+      <div style={{ border: '1px solid #e2e8f0', borderRadius: 8, height: 320, overflowY: 'auto', padding: 12, background: '#f8fafc', marginBottom: 12 }}>
+        {lines.length === 0 ? (
+          <div style={{ color: '#94a3b8', fontSize: 13, textAlign: 'center', marginTop: 130 }}>
+            (no messages yet)
+          </div>
+        ) : lines.map((line) => (
+          <div key={line.ts} style={{ display: 'flex', justifyContent: line.from === 'me' ? 'flex-end' : line.from === 'them' ? 'flex-start' : 'center', marginBottom: 6 }}>
+            <div style={{
+              padding: '6px 12px',
+              borderRadius: 12,
+              fontSize: 13,
+              maxWidth: '75%',
+              background: line.from === 'me' ? '#3b82f6' : line.from === 'them' ? '#e2e8f0' : 'transparent',
+              color: line.from === 'me' ? 'white' : line.from === 'them' ? '#0f172a' : '#94a3b8',
+              fontStyle: line.from === 'system' ? 'italic' : 'normal',
+              fontFamily: line.from === 'system' ? 'ui-monospace, monospace' : 'inherit',
+            }}>
+              {line.text}
+            </div>
+          </div>
+        ))}
+      </div>
+
+      <div style={{ display: 'flex', gap: 8 }}>
+        <input
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); handleSend(); } }}
+          disabled={!ready}
+          placeholder={ready ? 'Say something…' : 'Waiting for partner…'}
+          style={{ flex: 1, padding: '10px 12px', borderRadius: 8, border: '1px solid #cbd5e1', fontSize: 14, outline: 'none' }}
+        />
+        <button
+          onClick={handleSend}
+          disabled={!ready || !draft.trim()}
+          style={{
+            padding: '10px 20px',
+            borderRadius: 8,
+            border: 'none',
+            background: ready && draft.trim() ? '#3b82f6' : '#cbd5e1',
+            color: 'white',
+            fontSize: 14,
+            fontWeight: 600,
+            cursor: ready && draft.trim() ? 'pointer' : 'not-allowed',
+          }}
+        >
+          Send
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function StatusPill({ status }) {
+  const theme = status === 'connected'
+    ? { bg: '#dcfce7', color: '#166534' }
+    : status === 'error' || status === 'disconnected'
+      ? { bg: '#fee2e2', color: '#991b1b' }
+      : { bg: '#fef3c7', color: '#92400e' };
+  return (
+    <span style={{ background: theme.bg, color: theme.color, padding: '3px 10px', borderRadius: 999, fontSize: 11, fontWeight: 600, fontFamily: 'ui-monospace, monospace' }}>
+      {status}
+    </span>
+  );
+}
