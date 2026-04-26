@@ -1,19 +1,19 @@
 /**
  * @stele-manifest
- * name: Trevor ↔ Izaiah #973d
+ * name: Trevor ↔ Izaiah #8afe
  * version: 1.0.0
  * description: Paired chat between Izaiah and Trevor. Both files together unlock the conversation; the file IS the secret, so don't share with anyone you wouldn't want in the conversation. Messages travel end-to-end-encrypted over a WebRTC data channel — the signaling server only sees the SDP envelope.
  * archetype: paired
- * pairing_id: stele-pair-528badc0d609befa74a4f34e4e26973d
- * partner_pubkey: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE2jbxKUV6iTscjNUkKHe1199jEIng4ql+IYHquPNWbGeLH7xSjHUYusnbDJrb5LuVyHAEV8uMSla/bwe4ExH8Mw==
- * private_key: MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgVLdocr9eoibdCyQ9Jk70CK5fD5vIWaR2JjBoKCY/+kahRANCAASXQ54QlDSCXq+7MvyA7T2ahWidypOdx36Bb6K11paGgfG21gvPZMvMRgmeIb86LRo2Q5wFw6tWhgPTqZRGeGhu
+ * pairing_id: stele-pair-1c1f63a0750feabdff1d128fc5fc8afe
+ * partner_pubkey: MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEuTtGq21WWeqVq2YA5bZVAf8EPNOoijWGDcYhF1JJkBC2X8K8zhxOZ+nuoMR0FDu+XU12k6niPkcKO0fU1L0t1g==
+ * private_key: MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgdXrLEXViJnVlXFWe/KUfwRvickOy+l30wT0+QRq7PyihRANCAATFMNoQwyJScVpkblM0jN4dFjfnIMMtgEKLjwB+fX8emhjRS8PBhKFyzZ0v3nPlDdSnpLRFg7BPs/464vYd+zwG
  */
 
 import { useEffect, useRef, useState } from 'react';
 
 const ME = "Izaiah";
 const PARTNER = "Trevor";
-const SAFETY_CODE = "F01332";
+const SAFETY_CODE = "A5E301";
 
 export default function PairChat() {
   const [status, setStatus] = useState('not connected');
