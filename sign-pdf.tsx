@@ -1,110 +1,126 @@
 /**
  * @stele-manifest
  * name: The Signer
- * version: 1.0.0
- * description: Drop in a PDF, draw your signature on the pad, place it where you want, download the signed file. Runs entirely in your browser — the PDF never leaves your device. Companion piece to The Rotator.
+ * version: 2.0.0
+ * description: Drop a PDF, draw your signature, click anywhere on any page to drop a signature + date stamp. Place as many as you want, then download the signed PDF. Runs entirely in your browser — the file never leaves your device. Companion piece to The Rotator.
  * archetype: self-contained
- * requires:
- *   - network: https://cdnjs.cloudflare.com
  */
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { PDFDocument, StandardFonts, rgb } from 'pdf-lib';
+import * as pdfjsLib from 'pdfjs-dist';
 
-declare global {
-  interface Window { PDFLib: any }
+// ─── Types ──────────────────────────────────────────────────────────────────
+
+type SizeOpt = 'sm' | 'md' | 'lg';
+
+interface Placement {
+  id: string;
+  pageIndex: number;          // 0-based
+  xRatio: number;             // 0..1, fraction of page width (top-left origin)
+  yRatio: number;
+  size: SizeOpt;
+  withDate: boolean;
+  date: string;               // YYYY-MM-DD
 }
 
-// pdf-lib UMD — fetched at runtime and eval'd. Direct <script src=cdn> is blocked
-// by the sandbox CSP, but fetch is allowed once the network: capability is granted
-// and 'unsafe-eval' lets us run the source. The library mounts itself on window.PDFLib.
-const PDF_LIB_URL = 'https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js';
+interface RenderedPage {
+  pageNum: number;            // 1-based for display
+  pdfWidth: number;           // raw PDF coord units
+  pdfHeight: number;
+  imageDataUrl: string;
+  width: number;              // rendered px
+  height: number;
+}
 
-async function loadPdfLib(): Promise<any> {
-  if (window.PDFLib) return window.PDFLib;
-  const res = await fetch(PDF_LIB_URL);
-  if (!res.ok) throw new Error(`PDF library fetch failed (${res.status})`);
-  const src = await res.text();
-  // eslint-disable-next-line no-new-func
-  new Function(src)();
-  if (!window.PDFLib) throw new Error('PDF library did not register on window');
-  return window.PDFLib;
+// Signature width in PDF points for each size option.
+// Aspect ratio comes from the signature canvas (3:1 — see SIG_W/H below).
+const SIG_W_PT: Record<SizeOpt, number> = { sm: 90, md: 130, lg: 180 };
+const SIZE_LABEL: Record<SizeOpt, string> = { sm: 'Small', md: 'Medium', lg: 'Large' };
+
+// Signature canvas dimensions
+const SIG_W = 600;
+const SIG_H = 200;
+
+// PDF render scale — 2x for crisp display on hidpi
+const RENDER_SCALE = 2;
+
+function todayISO(): string {
+  const d = new Date();
+  const y = d.getFullYear();
+  const m = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${y}-${m}-${day}`;
+}
+
+function uid(): string {
+  return Math.random().toString(36).slice(2, 10);
 }
 
 // ─── Signature pad ──────────────────────────────────────────────────────────
 
 interface SignaturePadProps {
   onChange: (dataUrl: string | null) => void;
+  hasSignature: boolean;
 }
 
-function SignaturePad({ onChange }: SignaturePadProps) {
+function SignaturePad({ onChange, hasSignature }: SignaturePadProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const drawing = useRef(false);
   const lastPos = useRef<{ x: number; y: number } | null>(null);
-  const [hasInk, setHasInk] = useState(false);
 
-  // Match the canvas backing store to its CSS size for crisp lines
+  // Set fixed backing-store size for consistent stroke width across DPRs
   useEffect(() => {
-    const canvas = canvasRef.current;
-    if (!canvas) return;
-    const resize = () => {
-      const rect = canvas.getBoundingClientRect();
-      const dpr = window.devicePixelRatio || 1;
-      canvas.width = Math.round(rect.width * dpr);
-      canvas.height = Math.round(rect.height * dpr);
-      const ctx = canvas.getContext('2d');
-      if (ctx) ctx.scale(dpr, dpr);
-    };
-    resize();
-    const ro = new ResizeObserver(resize);
-    ro.observe(canvas);
-    return () => ro.disconnect();
+    const c = canvasRef.current;
+    if (!c) return;
+    c.width = SIG_W;
+    c.height = SIG_H;
   }, []);
 
   const getPos = (e: React.PointerEvent) => {
-    const canvas = canvasRef.current!;
-    const rect = canvas.getBoundingClientRect();
-    return { x: e.clientX - rect.left, y: e.clientY - rect.top };
+    const c = canvasRef.current!;
+    const rect = c.getBoundingClientRect();
+    return {
+      x: ((e.clientX - rect.left) / rect.width) * SIG_W,
+      y: ((e.clientY - rect.top) / rect.height) * SIG_H,
+    };
   };
 
   const onDown = (e: React.PointerEvent) => {
     e.preventDefault();
-    const canvas = canvasRef.current!;
-    canvas.setPointerCapture(e.pointerId);
+    canvasRef.current!.setPointerCapture(e.pointerId);
     drawing.current = true;
     lastPos.current = getPos(e);
   };
 
   const onMove = (e: React.PointerEvent) => {
     if (!drawing.current) return;
-    const canvas = canvasRef.current!;
-    const ctx = canvas.getContext('2d');
+    const c = canvasRef.current!;
+    const ctx = c.getContext('2d');
     if (!ctx || !lastPos.current) return;
     const pos = getPos(e);
     ctx.lineCap = 'round';
     ctx.lineJoin = 'round';
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = 4;
     ctx.strokeStyle = '#1a1714';
     ctx.beginPath();
     ctx.moveTo(lastPos.current.x, lastPos.current.y);
     ctx.lineTo(pos.x, pos.y);
     ctx.stroke();
     lastPos.current = pos;
-    if (!hasInk) setHasInk(true);
   };
 
   const onUp = (e: React.PointerEvent) => {
     if (!drawing.current) return;
     drawing.current = false;
-    const canvas = canvasRef.current!;
-    canvas.releasePointerCapture(e.pointerId);
-    onChange(canvas.toDataURL('image/png'));
+    canvasRef.current!.releasePointerCapture(e.pointerId);
+    onChange(canvasRef.current!.toDataURL('image/png'));
   };
 
   const clear = () => {
-    const canvas = canvasRef.current!;
-    const ctx = canvas.getContext('2d');
-    if (ctx) ctx.clearRect(0, 0, canvas.width, canvas.height);
-    setHasInk(false);
+    const c = canvasRef.current!;
+    const ctx = c.getContext('2d');
+    if (ctx) ctx.clearRect(0, 0, c.width, c.height);
     onChange(null);
   };
 
@@ -119,8 +135,82 @@ function SignaturePad({ onChange }: SignaturePadProps) {
         onPointerCancel={onUp}
       />
       <div className="sigpad-row">
-        <div className="xs-label">{hasInk ? 'looks good' : 'draw above'}</div>
-        <button className="btn btn-ghost" onClick={clear} disabled={!hasInk}>Clear</button>
+        <div className="xs-label">{hasSignature ? 'looks good — click on a page to place' : 'draw your signature above'}</div>
+        <button className="btn btn-ghost" onClick={clear} disabled={!hasSignature}>Clear</button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Page view ──────────────────────────────────────────────────────────────
+
+interface PageViewProps {
+  page: RenderedPage;
+  pageIndex: number;
+  placements: Placement[];
+  onClick: (pageIndex: number, xRatio: number, yRatio: number) => void;
+  onRemove: (id: string) => void;
+  signature: string | null;
+  canPlace: boolean;
+}
+
+function PageView({ page, pageIndex, placements, onClick, onRemove, signature, canPlace }: PageViewProps) {
+  const wrapRef = useRef<HTMLDivElement>(null);
+
+  const handleClick = (e: React.MouseEvent) => {
+    if (!canPlace) return;
+    if (e.target instanceof HTMLElement && e.target.closest('.stamp-remove')) return;
+    const rect = wrapRef.current!.getBoundingClientRect();
+    const xRatio = (e.clientX - rect.left) / rect.width;
+    const yRatio = (e.clientY - rect.top) / rect.height;
+    onClick(pageIndex, xRatio, yRatio);
+  };
+
+  return (
+    <div className="page-frame">
+      <div className="page-num xs-label">Page {page.pageNum}</div>
+      <div
+        ref={wrapRef}
+        className={`page-canvas ${canPlace ? 'placeable' : ''}`}
+        onClick={handleClick}
+        style={{ aspectRatio: `${page.width} / ${page.height}` }}
+      >
+        {/* eslint-disable-next-line @next/next/no-img-element */}
+        <img src={page.imageDataUrl} alt={`Page ${page.pageNum}`} draggable={false} />
+        {placements.map((p) => {
+          // Width as a fraction of page width (height comes from the signature's
+          // intrinsic 3:1 aspect ratio — see SIG_W / SIG_H constants).
+          const widthRatio = SIG_W_PT[p.size] / page.pdfWidth;
+          return (
+            <div
+              key={p.id}
+              className="stamp"
+              style={{
+                left: `${p.xRatio * 100}%`,
+                top: `${p.yRatio * 100}%`,
+                width: `${widthRatio * 100}%`,
+                transform: 'translate(-50%, -50%)',
+              }}
+            >
+              {signature && (
+                <img
+                  src={signature}
+                  alt="signature"
+                  draggable={false}
+                  style={{ width: '100%', display: 'block' }}
+                />
+              )}
+              {p.withDate && (
+                <div className="stamp-date">{p.date}</div>
+              )}
+              <button
+                className="stamp-remove"
+                onClick={(e) => { e.stopPropagation(); onRemove(p.id); }}
+                aria-label="Remove signature"
+              >×</button>
+            </div>
+          );
+        })}
       </div>
     </div>
   );
@@ -128,52 +218,62 @@ function SignaturePad({ onChange }: SignaturePadProps) {
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
-type Position = 'tl' | 'tr' | 'bl' | 'br' | 'center';
-type PageMode = 'last' | 'first' | 'all';
-type SizeOpt = 'sm' | 'md' | 'lg';
-
-const SIZE_PX: Record<SizeOpt, number> = { sm: 100, md: 150, lg: 220 };
-const SIZE_LABEL: Record<SizeOpt, string> = { sm: 'Small', md: 'Medium', lg: 'Large' };
-
 export default function Signer() {
   const [pdfBytes, setPdfBytes] = useState<Uint8Array | null>(null);
   const [pdfName, setPdfName] = useState<string>('');
-  const [pdfPages, setPdfPages] = useState<number>(0);
+  const [pages, setPages] = useState<RenderedPage[]>([]);
   const [signature, setSignature] = useState<string | null>(null);
-  const [position, setPosition] = useState<Position>('br');
-  const [pageMode, setPageMode] = useState<PageMode>('last');
-  const [sizeOpt, setSizeOpt] = useState<SizeOpt>('md');
-  const [libReady, setLibReady] = useState(false);
-  const [libError, setLibError] = useState<string | null>(null);
+  const [placements, setPlacements] = useState<Placement[]>([]);
+  const [withDate, setWithDate] = useState(true);
+  const [size, setSize] = useState<SizeOpt>('md');
+  const [loading, setLoading] = useState(false);
   const [signing, setSigning] = useState(false);
-  const [signError, setSignError] = useState<string | null>(null);
+  const [error, setError] = useState<string | null>(null);
   const [dragging, setDragging] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  // Pre-fetch pdf-lib so the user sees zero delay on click
-  useEffect(() => {
-    loadPdfLib()
-      .then(() => setLibReady(true))
-      .catch((err: any) => setLibError(err.message ?? String(err)));
-  }, []);
+  const canPlace = !!signature && pages.length > 0;
 
   const ingestFile = useCallback(async (file: File) => {
-    setSignError(null);
+    setError(null);
     if (!file.name.toLowerCase().endsWith('.pdf') && file.type !== 'application/pdf') {
-      setSignError('That file does not look like a PDF.');
+      setError('That file does not look like a PDF.');
       return;
     }
+    setLoading(true);
     try {
       const buf = await file.arrayBuffer();
       const bytes = new Uint8Array(buf);
-      // peek at page count via pdf-lib (only after load)
-      const PDFLib = await loadPdfLib();
-      const doc = await PDFLib.PDFDocument.load(bytes, { updateMetadata: false });
+
+      // pdfjs mutates the input array — keep a clean copy for pdf-lib later.
+      const pdf = await pdfjsLib.getDocument({ data: bytes.slice(0) }).promise;
+      const out: RenderedPage[] = [];
+      for (let i = 1; i <= pdf.numPages; i++) {
+        const pdfPage = await pdf.getPage(i);
+        const viewport = pdfPage.getViewport({ scale: RENDER_SCALE });
+        const canvas = document.createElement('canvas');
+        canvas.width = Math.round(viewport.width);
+        canvas.height = Math.round(viewport.height);
+        const ctx = canvas.getContext('2d')!;
+        await pdfPage.render({ canvasContext: ctx, viewport }).promise;
+        const view = pdfPage.view;          // [x1, y1, x2, y2] in PDF points
+        out.push({
+          pageNum: i,
+          pdfWidth: view[2] - view[0],
+          pdfHeight: view[3] - view[1],
+          imageDataUrl: canvas.toDataURL('image/png'),
+          width: canvas.width,
+          height: canvas.height,
+        });
+      }
       setPdfBytes(bytes);
       setPdfName(file.name);
-      setPdfPages(doc.getPageCount());
+      setPages(out);
+      setPlacements([]);
     } catch (err: any) {
-      setSignError(`Couldn't read that PDF: ${err.message ?? String(err)}`);
+      setError(`Couldn't read that PDF: ${err.message ?? String(err)}`);
+    } finally {
+      setLoading(false);
     }
   }, []);
 
@@ -183,54 +283,75 @@ export default function Signer() {
     const f = e.dataTransfer.files?.[0];
     if (f) void ingestFile(f);
   };
-
   const onDragOver = (e: React.DragEvent) => { e.preventDefault(); setDragging(true); };
   const onDragLeave = () => setDragging(false);
-
   const onFilePick = (e: React.ChangeEvent<HTMLInputElement>) => {
     const f = e.target.files?.[0];
     if (f) void ingestFile(f);
   };
 
   const reset = () => {
-    setPdfBytes(null); setPdfName(''); setPdfPages(0);
-    setSignature(null); setSignError(null);
+    setPdfBytes(null); setPdfName(''); setPages([]); setPlacements([]);
+    setError(null);
     if (fileInputRef.current) fileInputRef.current.value = '';
   };
 
+  const placeStamp = (pageIndex: number, xRatio: number, yRatio: number) => {
+    setPlacements((ps) => [
+      ...ps,
+      {
+        id: uid(),
+        pageIndex,
+        xRatio,
+        yRatio,
+        size,
+        withDate,
+        date: todayISO(),
+      },
+    ]);
+  };
+
+  const removeStamp = (id: string) => {
+    setPlacements((ps) => ps.filter((p) => p.id !== id));
+  };
+
+  const clearAllStamps = () => setPlacements([]);
+
   const signAndDownload = async () => {
-    if (!pdfBytes || !signature) return;
+    if (!pdfBytes || !signature || placements.length === 0) return;
     setSigning(true);
-    setSignError(null);
+    setError(null);
     try {
-      const PDFLib = await loadPdfLib();
-      const doc = await PDFLib.PDFDocument.load(pdfBytes);
+      const doc = await PDFDocument.load(pdfBytes);
       const sigBytes = await fetch(signature).then((r) => r.arrayBuffer());
       const sigImage = await doc.embedPng(sigBytes);
+      const font = await doc.embedFont(StandardFonts.Helvetica);
+      const docPages = doc.getPages();
 
-      const pages = doc.getPages();
-      const targetIdx =
-        pageMode === 'all' ? pages.map((_: unknown, i: number) => i)
-        : pageMode === 'first' ? [0]
-        : [pages.length - 1];
-
-      const sigW = SIZE_PX[sizeOpt];
-      const aspect = sigImage.height / sigImage.width;
-      const sigH = sigW * aspect;
-      const margin = 36;
-
-      for (const i of targetIdx) {
-        const page = pages[i];
+      for (const p of placements) {
+        const page = docPages[p.pageIndex];
+        if (!page) continue;
         const { width: pw, height: ph } = page.getSize();
-        let x = margin, y = margin;
-        switch (position) {
-          case 'tl': x = margin; y = ph - sigH - margin; break;
-          case 'tr': x = pw - sigW - margin; y = ph - sigH - margin; break;
-          case 'bl': x = margin; y = margin; break;
-          case 'br': x = pw - sigW - margin; y = margin; break;
-          case 'center': x = (pw - sigW) / 2; y = (ph - sigH) / 2; break;
-        }
+        const sigW = SIG_W_PT[p.size];
+        // Maintain canvas aspect (3:1).
+        const sigH = sigW * (SIG_H / SIG_W);
+        // ratio is top-left origin → flip Y for PDF (bottom-left origin).
+        const cx = p.xRatio * pw;
+        const cy = ph - p.yRatio * ph;
+        const x = cx - sigW / 2;
+        const y = cy - sigH / 2;
         page.drawImage(sigImage, { x, y, width: sigW, height: sigH });
+        if (p.withDate) {
+          const fontSize = Math.max(8, Math.round(sigW / 14));
+          const textWidth = font.widthOfTextAtSize(p.date, fontSize);
+          page.drawText(p.date, {
+            x: cx - textWidth / 2,
+            y: y - fontSize - 4,
+            size: fontSize,
+            font,
+            color: rgb(0.10, 0.09, 0.08),
+          });
+        }
       }
 
       const out = await doc.save();
@@ -244,13 +365,19 @@ export default function Signer() {
       document.body.removeChild(a);
       setTimeout(() => URL.revokeObjectURL(url), 1000);
     } catch (err: any) {
-      setSignError(`Signing failed: ${err.message ?? String(err)}`);
+      setError(`Signing failed: ${err.message ?? String(err)}`);
     } finally {
       setSigning(false);
     }
   };
 
-  const canSign = !!pdfBytes && !!signature && libReady && !signing;
+  const stampsByPage = useMemo(() => {
+    const m: Record<number, Placement[]> = {};
+    for (const p of placements) {
+      (m[p.pageIndex] ||= []).push(p);
+    }
+    return m;
+  }, [placements]);
 
   return (
     <>
@@ -266,20 +393,18 @@ export default function Signer() {
         <div className="grain" aria-hidden="true" />
         <div className="wrap">
 
-          {/* Header */}
           <header className="head">
             <div className="xs-label">Stele &middot; 02</div>
             <h1 className="title font-display">The Signer</h1>
             <p className="sub">
-              Drop a PDF. Draw your signature. Pick a corner. Save it back. The
-              file never leaves your device — it's signed in your browser, by
-              you.
+              Drop a PDF. Draw your signature. Click anywhere on any page to
+              drop a signature + date stamp. Place as many as you like. Download
+              the signed file. Nothing leaves your device.
             </p>
             <div className="ink-line" />
           </header>
 
-          {/* Step 1 — drop */}
-          {!pdfBytes && (
+          {!pdfBytes && !loading && (
             <section className="panel">
               <div className="step-tag">Step 01</div>
               <div
@@ -302,77 +427,68 @@ export default function Signer() {
                 style={{ display: 'none' }}
                 onChange={onFilePick}
               />
+              {error && <div className="error">{error}</div>}
             </section>
           )}
 
-          {/* Step 2 + 3 — once a PDF is in */}
-          {pdfBytes && (
+          {loading && (
+            <section className="panel">
+              <div className="step-tag">Loading</div>
+              <p className="font-display" style={{ fontSize: 24, margin: 0 }}>Reading the PDF…</p>
+              <p className="hint" style={{ marginTop: 4 }}>Each page is rendered locally.</p>
+            </section>
+          )}
+
+          {pdfBytes && pages.length > 0 && (
             <>
-              <section className="panel">
+              <section className="panel sticky-top">
                 <div className="panel-head">
-                  <div>
-                    <div className="step-tag">Step 02 &nbsp;·&nbsp; Loaded</div>
+                  <div className="meta-col">
+                    <div className="step-tag">Loaded</div>
                     <div className="filename font-display">{pdfName}</div>
                     <div className="src">
-                      {pdfPages} page{pdfPages === 1 ? '' : 's'}
+                      {pages.length} page{pages.length === 1 ? '' : 's'}
+                      {' · '}
+                      {placements.length} stamp{placements.length === 1 ? '' : 's'} placed
                     </div>
                   </div>
-                  <button className="btn btn-ghost" onClick={reset}>Reset</button>
+                  <div className="head-actions">
+                    {placements.length > 0 && (
+                      <button className="btn btn-ghost" onClick={clearAllStamps}>Clear stamps</button>
+                    )}
+                    <button className="btn btn-ghost" onClick={reset}>New PDF</button>
+                  </div>
                 </div>
-              </section>
 
-              <section className="panel">
-                <div className="step-tag">Step 03 &nbsp;·&nbsp; Draw your signature</div>
-                <SignaturePad onChange={setSignature} />
-              </section>
-
-              <section className="panel">
-                <div className="step-tag">Step 04 &nbsp;·&nbsp; Place it</div>
+                <SignaturePad onChange={setSignature} hasSignature={!!signature} />
 
                 <div className="control-grid">
-                  <div className="control">
-                    <div className="xs-label">Pages</div>
-                    <div className="seg">
-                      {(['last', 'first', 'all'] as PageMode[]).map((m) => (
-                        <button
-                          key={m}
-                          className={`seg-btn ${pageMode === m ? 'on' : ''}`}
-                          onClick={() => setPageMode(m)}
-                        >
-                          {m === 'last' ? 'Last only' : m === 'first' ? 'First only' : 'All pages'}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
-                  <div className="control">
-                    <div className="xs-label">Position</div>
-                    <div className="pos-grid">
-                      {(['tl', 'tr', 'bl', 'br', 'center'] as Position[]).map((p) => (
-                        <button
-                          key={p}
-                          className={`pos-cell ${p === 'center' ? 'is-center' : ''} pos-${p} ${position === p ? 'on' : ''}`}
-                          onClick={() => setPosition(p)}
-                          aria-label={`Position ${p}`}
-                        >
-                          <span className="dot" />
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-
                   <div className="control">
                     <div className="xs-label">Size</div>
                     <div className="seg">
                       {(['sm', 'md', 'lg'] as SizeOpt[]).map((s) => (
                         <button
                           key={s}
-                          className={`seg-btn ${sizeOpt === s ? 'on' : ''}`}
-                          onClick={() => setSizeOpt(s)}
+                          className={`seg-btn ${size === s ? 'on' : ''}`}
+                          onClick={() => setSize(s)}
                         >
                           {SIZE_LABEL[s]}
                         </button>
                       ))}
+                    </div>
+                  </div>
+
+                  <div className="control">
+                    <div className="xs-label">With date</div>
+                    <div className="seg">
+                      <button
+                        className={`seg-btn ${withDate ? 'on' : ''}`}
+                        onClick={() => setWithDate(true)}
+                      >On — {todayISO()}</button>
+                      <button
+                        className={`seg-btn ${!withDate ? 'on' : ''}`}
+                        onClick={() => setWithDate(false)}
+                      >Off</button>
                     </div>
                   </div>
                 </div>
@@ -381,25 +497,37 @@ export default function Signer() {
                   <button
                     className="btn primary"
                     onClick={signAndDownload}
-                    disabled={!canSign}
+                    disabled={!signature || placements.length === 0 || signing}
                   >
-                    {signing ? 'Signing…' : 'Sign & download'}
+                    {signing ? 'Signing…' : `Sign & download${placements.length ? ` (${placements.length})` : ''}`}
                   </button>
-                  {!libReady && !libError && (
-                    <span className="hint">Loading PDF engine…</span>
-                  )}
+                  {!signature && <span className="hint">draw a signature first</span>}
+                  {signature && placements.length === 0 && <span className="hint">click on the PDF to place</span>}
                 </div>
 
-                {(signError || libError) && (
-                  <div className="error">{signError || libError}</div>
-                )}
+                {error && <div className="error">{error}</div>}
+              </section>
+
+              <section>
+                {pages.map((p, i) => (
+                  <PageView
+                    key={i}
+                    page={p}
+                    pageIndex={i}
+                    placements={stampsByPage[i] || []}
+                    onClick={placeStamp}
+                    onRemove={removeStamp}
+                    signature={signature}
+                    canPlace={canPlace}
+                  />
+                ))}
               </section>
             </>
           )}
 
           <footer className="foot">
-            <span className="xs-label">Stele · self-contained · runs offline once loaded</span>
-            <span className="xs-label">pdf-lib · MIT</span>
+            <span className="xs-label">Stele · self-contained · runs offline</span>
+            <span className="xs-label">pdf-lib + pdf.js · MIT</span>
           </footer>
         </div>
       </div>
@@ -438,7 +566,7 @@ const CSS = `
   position: fixed; inset: 0; pointer-events: none; opacity: 0.04; z-index: 1;
   background-image: url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='160' height='160'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2'/><feColorMatrix values='0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 0.6 0'/></filter><rect width='100%25' height='100%25' filter='url(%23n)'/></svg>");
 }
-.wrap { position: relative; max-width: 880px; margin: 0 auto; padding: 40px 24px; z-index: 2; }
+.wrap { position: relative; max-width: 980px; margin: 0 auto; padding: 40px 24px; z-index: 2; }
 @media (min-width: 768px) { .wrap { padding: 56px 40px; } }
 
 .font-display { font-family: "Fraunces", Georgia, serif; font-variation-settings: "opsz" 144, "SOFT" 50; }
@@ -454,9 +582,16 @@ const CSS = `
 }
 @media (min-width: 768px) { .panel { padding: 28px; } }
 
+.sticky-top {
+  position: sticky; top: 0; z-index: 10;
+  box-shadow: 0 8px 24px -16px rgba(60,40,20,0.25);
+}
+
 .step-tag { font-size: 10px; letter-spacing: 0.25em; text-transform: uppercase; color: var(--muted); margin-bottom: 14px; }
-.panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; }
-.filename { font-size: clamp(22px, 3.2vw, 30px); line-height: 1.1; word-break: break-all; max-width: 100%; }
+.panel-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; flex-wrap: wrap; margin-bottom: 18px; }
+.meta-col { flex: 1 1 240px; min-width: 0; }
+.head-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.filename { font-size: clamp(20px, 2.6vw, 26px); line-height: 1.1; word-break: break-all; }
 .src { font-size: 11px; color: var(--muted); margin-top: 6px; }
 
 .drop {
@@ -473,8 +608,7 @@ const CSS = `
 }
 .disc.dragging { background: var(--accent); }
 .drop .big { font-size: clamp(28px, 4vw, 40px); line-height: 1; margin: 0 0 6px; }
-.drop .hint { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
-.hint { font-size: 12px; color: var(--muted); }
+.drop .hint, .hint { font-size: 12px; color: var(--muted); margin: 4px 0 0; }
 
 .btn {
   display: inline-flex; align-items: center; gap: 8px; padding: 10px 16px; font-size: 11px;
@@ -493,20 +627,20 @@ const CSS = `
 .btn.primary:hover { background: #8f3a23; border-color: #8f3a23; }
 .btn.primary[disabled] { background: var(--accent); border-color: var(--accent); }
 
-.sigpad-wrap { background: var(--paper-3); border: 1px solid var(--line); border-radius: 2px; padding: 12px; }
+.sigpad-wrap { background: var(--paper-3); border: 1px solid var(--line); border-radius: 2px; padding: 12px; margin-bottom: 16px; }
 .sigpad {
-  display: block; width: 100%; height: 200px; background: #fbf7ea;
+  display: block; width: 100%; height: 160px; background: #fbf7ea;
   border: 1px dashed var(--rule); border-radius: 2px;
   touch-action: none; cursor: crosshair;
 }
-.sigpad-row { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; }
+.sigpad-row { display: flex; align-items: center; justify-content: space-between; margin-top: 10px; gap: 12px; flex-wrap: wrap; }
 
 .control-grid {
-  display: grid; gap: 24px; margin-top: 4px;
+  display: grid; gap: 16px; margin: 8px 0 0;
   grid-template-columns: 1fr;
 }
-@media (min-width: 720px) { .control-grid { grid-template-columns: 1fr 1fr 1fr; gap: 32px; } }
-.control .xs-label { margin-bottom: 10px; }
+@media (min-width: 720px) { .control-grid { grid-template-columns: 1fr 1fr; gap: 28px; } }
+.control .xs-label { margin-bottom: 8px; display: block; }
 
 .seg { display: flex; flex-wrap: wrap; gap: 6px; }
 .seg-btn {
@@ -517,32 +651,54 @@ const CSS = `
 .seg-btn:hover { border-color: var(--ink); color: var(--ink); }
 .seg-btn.on { background: var(--ink); color: var(--paper); border-color: var(--ink); }
 
-.pos-grid {
-  display: grid; grid-template-columns: repeat(3, 36px); grid-template-rows: repeat(3, 36px);
-  gap: 6px; padding: 6px; background: var(--paper-3); border: 1px solid var(--line); border-radius: 2px;
-  width: max-content;
-}
-.pos-cell {
-  border: 1px solid var(--rule); background: var(--paper-2); border-radius: 2px;
-  cursor: pointer; padding: 0; display: flex; align-items: center; justify-content: center;
-}
-.pos-cell:hover { border-color: var(--ink); }
-.pos-cell .dot {
-  width: 6px; height: 6px; background: var(--muted); border-radius: 50%; opacity: 0.4;
-}
-.pos-cell.on { background: var(--ink); border-color: var(--ink); }
-.pos-cell.on .dot { background: var(--accent); opacity: 1; }
-.pos-tl { grid-column: 1; grid-row: 1; }
-.pos-tr { grid-column: 3; grid-row: 1; }
-.pos-bl { grid-column: 1; grid-row: 3; }
-.pos-br { grid-column: 3; grid-row: 3; }
-.pos-center { grid-column: 2; grid-row: 2; }
-
-.cta-row { margin-top: 26px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
+.cta-row { margin-top: 18px; padding-top: 16px; border-top: 1px dashed var(--rule); display: flex; align-items: center; gap: 16px; flex-wrap: wrap; }
 .error {
   margin-top: 16px; padding: 10px 14px; background: #fbe6df; border: 1px solid var(--accent);
   color: #6f2412; font-size: 12px; border-radius: 2px;
 }
+
+/* PDF page view */
+.page-frame { margin-bottom: 28px; }
+.page-num { margin-bottom: 8px; }
+.page-canvas {
+  position: relative;
+  background: #fff;
+  box-shadow: 0 1px 0 rgba(0,0,0,0.05), 0 14px 32px -18px rgba(60,40,20,0.35);
+  border: 1px solid var(--line);
+  width: 100%;
+  user-select: none;
+  -webkit-user-select: none;
+}
+.page-canvas.placeable { cursor: copy; }
+.page-canvas img { width: 100%; height: 100%; display: block; pointer-events: none; }
+
+.stamp {
+  position: absolute;
+  pointer-events: none;
+  display: flex; flex-direction: column; align-items: center;
+}
+.stamp img { pointer-events: none; }
+.stamp-date {
+  margin-top: 2px;
+  font-size: clamp(8px, 0.9vw, 11px);
+  color: var(--ink);
+  font-family: "JetBrains Mono", ui-monospace, monospace;
+  background: rgba(255,255,255,0.7);
+  padding: 1px 4px;
+  border-radius: 1px;
+}
+.stamp-remove {
+  position: absolute; top: -10px; right: -10px;
+  width: 22px; height: 22px;
+  background: var(--accent); color: var(--paper);
+  border: none; border-radius: 50%;
+  font-size: 14px; line-height: 1; cursor: pointer;
+  pointer-events: auto;
+  display: flex; align-items: center; justify-content: center;
+  box-shadow: 0 2px 6px rgba(0,0,0,0.2);
+  font-family: inherit;
+}
+.stamp-remove:hover { background: #8f3a23; }
 
 .foot {
   margin-top: 32px; padding-top: 18px; border-top: 1px dashed var(--rule);
