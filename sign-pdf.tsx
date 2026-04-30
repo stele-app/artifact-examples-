@@ -45,6 +45,17 @@ const SIG_H = 200;
 // PDF render scale — 2x for crisp display on hidpi
 const RENDER_SCALE = 2;
 
+// Decode a data:image/png;base64,... URL to raw bytes WITHOUT fetch().
+// fetch(dataUrl) goes through CSP connect-src, which is 'none' for
+// no-network artifacts — so the fetch fails. atob keeps everything in-process.
+function dataUrlToBytes(dataUrl: string): Uint8Array {
+  const comma = dataUrl.indexOf(',');
+  const bin = atob(dataUrl.slice(comma + 1));
+  const bytes = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  return bytes;
+}
+
 function todayISO(): string {
   const d = new Date();
   const y = d.getFullYear();
@@ -323,7 +334,7 @@ export default function Signer() {
     setError(null);
     try {
       const doc = await PDFDocument.load(pdfBytes);
-      const sigBytes = await fetch(signature).then((r) => r.arrayBuffer());
+      const sigBytes = dataUrlToBytes(signature);
       const sigImage = await doc.embedPng(sigBytes);
       const font = await doc.embedFont(StandardFonts.Helvetica);
       const docPages = doc.getPages();
